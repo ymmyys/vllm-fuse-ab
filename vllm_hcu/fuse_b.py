@@ -70,10 +70,13 @@ def _rs_norm_qkv(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, 
         return torch.cat(parts, dim=-1)
     b, e = fuse_a._comm.row_range(T)
     y = fuse_a._op(x.contiguous(), residual[b:e], weight, eps, out=x.new_empty((e - b, x.shape[1])), gather=False)
-    rows = w.fused_qkv_a_proj(y)[0]
-    if KW:
-        rows = torch.cat([rows, w.indexer.wk_weights_proj(y)[0]], dim=-1)
     D = Q + KV + R + KW
+    if y.shape[0] == 0:  # T < W: trailing ranks own no rows
+        rows = y.new_empty((0, D))
+    else:
+        rows = w.fused_qkv_a_proj(y)[0]
+        if KW:
+            rows = torch.cat([rows, w.indexer.wk_weights_proj(y)[0]], dim=-1)
     return _qkv_op(D)(rows.contiguous(), T, w.q_a_layernorm.weight, w.q_a_layernorm.variance_epsilon,
                       w.kv_a_layernorm.weight, w.kv_a_layernorm.variance_epsilon)
 

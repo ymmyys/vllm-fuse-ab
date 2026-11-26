@@ -16,7 +16,6 @@ logger = init_logger(__name__)
 
 ENABLED = os.environ.get("VLLM_HCU_FUSE_A", "0") == "1"
 KERNEL_PATH = os.environ.get("VLLM_HCU_FUSE_A_KERNEL", "/root/fuse-a/10-intra-node-rs-norm-ag.py")
-NATIVE_MAX_TOKENS = int(os.environ.get("VLLM_HCU_FUSE_A_NATIVE_MAX_TOKENS", "128"))
 FUSE_B = os.environ.get("VLLM_HCU_FUSE_B", "0") == "1"
 GATHER_RESIDUAL = os.environ.get("VLLM_HCU_FUSE_A_GATHER_RESIDUAL", "0" if FUSE_B else "1") == "1"
 FINAL = os.environ.get("VLLM_HCU_FUSE_A_FINAL", "1") == "1"
@@ -65,11 +64,11 @@ def init(vllm_config, hidden_size: int, dtype: torch.dtype):
         D = (cfg.q_lora_rank + cfg.kv_lora_rank + cfg.qk_rope_head_dim
              + getattr(cfg, "index_head_dim", 0) + getattr(cfg, "index_n_heads", 0))
         pb = max(pb, mod.fused_qkv_norm_ag.parity_bytes(tp, max_tokens, D, dtype))
-    _comm = mod.RingComm(pb, peer="ipc", platform="hcu")
+    _comm = mod.RingComm(pb, peer="ipc", platform="hcu", cuda_graph=not vllm_config.model_config.enforce_eager)
     _op = mod.fused_rs_add_rms_norm_ag(_comm, max_tokens, hidden_size, dtype)
     _mod, _max_tokens, _dtype = mod, max_tokens, dtype
-    logger.info("fuse A: RingComm %.0f MiB, max_tokens=%d, native when T <= %d, gather residual=%s, final=%s, "
-                "quant=%d, fuse B=%s", _comm.buf.numel() / 2**20, max_tokens, NATIVE_MAX_TOKENS, GATHER_RESIDUAL, FINAL,
+    logger.info("fuse A: RingComm %.0f MiB, max_tokens=%d, cuda_graph=%s, gather residual=%s, final=%s, "
+                "quant=%d, fuse B=%s", _comm.buf.numel() / 2**20, max_tokens, _comm.cuda_graph, GATHER_RESIDUAL, FINAL,
                 QUANT, FUSE_B)
 
 
@@ -92,8 +91,7 @@ def _gather_residual(residual, b, e):
 def _rs_norm_ag(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float,
                 gather_residual: bool) -> torch.Tensor:
     T = x.shape[0]
-    if (_op is None or T <= NATIVE_MAX_TOKENS or torch.cuda.is_current_stream_capturing()
-            or not residual.is_contiguous()):
+    if _op is None:
         return _native(x, residual, weight, eps)
     b, e = _comm.row_range(T)
     out = torch.empty_like(x)
@@ -151,8 +149,7 @@ def _quant(x):
 
 
 def _fused(T, residual):
-    return not (_op is None or T <= NATIVE_MAX_TOKENS or torch.cuda.is_current_stream_capturing()
-                or not residual.is_contiguous())
+    return _op is not None
 
 
 def _rs_norm_ag_quant(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
@@ -181,6 +178,9 @@ def register_moe(layer_idx: int, moe):
 
 
 def _route(moe, y):
+    if y.shape[0] == 0:  # T < W: trailing ranks own no rows
+        k = moe.experts.top_k
+        return y.new_empty((0, k), dtype=torch.float32), y.new_empty((0, k), dtype=torch.int32)
     logits, _ = moe.gate(y)
     return moe.experts.runner.router.select_experts(hidden_states=y, router_logits=logits)
 
@@ -189,7 +189,7 @@ def _gather_rows(ts, T):
     W = _comm.world_size
     chunk = (T + W - 1) // W
     rows = ts[0].shape[0]
-    raw = [t.contiguous().view(torch.uint8).view(rows, -1) for t in ts]
+    raw = [t.contiguous().view(torch.uint8).view(rows, t.shape[-1] * t.element_size()) for t in ts]
     widths = [r.shape[1] for r in raw]
     own = raw[0].new_zeros((chunk, sum(widths)))
     if rows:
