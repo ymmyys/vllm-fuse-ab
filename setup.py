@@ -1,5 +1,3 @@
-# 镜像自带 setuptools 59（读不了 pyproject 的 [project]），用 setup.py。
-# 安装：pip install --no-deps --no-build-isolation .
 from setuptools import setup
 
 setup(

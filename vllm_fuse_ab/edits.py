@@ -1,10 +1,7 @@
-# 对厂商 vllm_hcu/models/deepseek_v2.py 的源码改动：(原文, 新文[, 出现次数])。
-# 位置 A / B 的融合都由 fuse_a.py / fuse_b.py 里的开关决定，开关全关时走的是厂商原来的逻辑。
 EDITS = [
     # 1. import
     ("import vllm_hcu.platforms.envs as henvs\n",
      "import vllm_hcu.platforms.envs as henvs\nfrom vllm_fuse_ab import fuse_a, fuse_b\n"),
-    # 2. MLA attention：融合层的 o_proj 只出部分和，AR 交给融合 kernel 的 RS
     ("""        self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
@@ -23,7 +20,6 @@ EDITS = [
             disable_tp=vllm_config.parallel_config.enable_lightly_cp,
         )
 """),
-    # 3. DecoderLayer.__init__：记下本层是否融合
     ("""        self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -44,7 +40,6 @@ EDITS = [
                 raise RuntimeError(f"fuse B expects MLA at layer {layer_idx}")
             fuse_b.register_attn(layer_idx, self.self_attn)
 """),
-    # 4. DecoderLayer.forward：AR + post_attention_layernorm 换成 RS + add + RMSNorm + AG（+ 量化 / 路由，见 fuse_a.QUANT）
     ("""        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 """, """        if self.fuse_a:
@@ -53,11 +48,9 @@ EDITS = [
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
 """),
-    # 4a. DeepseekV2MoE：QUANT=2 时融合层的 gate 不交给 FusedMoE，router 在 A 里算
     ("""            gate=self.gate,
 """, """            gate=fuse_a.moe_gate(get_current_vllm_config(), config, int(prefix.split(".")[-2]), self.gate),
 """),
-    # 4b. DeepseekV2MoE.forward：收 A 给的量化输入 / 路由结果
     ("""    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         enable_lightly_cp = get_forward_context().enable_lightly_cp
 """, """    def forward(self, hidden_states: torch.Tensor, quanted=None, topk=None) -> torch.Tensor:
@@ -85,14 +78,12 @@ EDITS = [
                 hidden_states=hidden_states, router_logits=router_logits, **kw
             )
 """),
-    # 5. DeepseekV2MoE：最后一层融合 final norm 时，MoE 输出不做 AR（routed * scale + shared 的部分和交给 RS）
     ("""            prefix=f"{prefix}.experts",
             scoring_func=getattr(config, "scoring_func", "softmax"),
 """, """            prefix=f"{prefix}.experts",
             reduce_results=fuse_b.moe_reduce_results(get_current_vllm_config(), config, int(prefix.split(".")[-2])),
             scoring_func=getattr(config, "scoring_func", "softmax"),
 """),
-    # B1. DecoderLayer.forward：上一层 MoE 输出的 AR + input_layernorm + qkv_a + q/kv norm 换成 B（fuse_b.py）
     ("""        if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
@@ -116,7 +107,6 @@ EDITS = [
         if self.fuse_b:
             attn_kwargs["fuse_b_qkv"] = True
 """),
-    # B2. DeepseekV2MLAAttention.forward：B 给的是 q_c / kv_c 已经 norm 好的 [T, D]
     ("""    def forward(
         self,
         positions: torch.Tensor,
@@ -135,7 +125,6 @@ EDITS = [
             return fuse_b.mla_forward(self.mla_attn, positions, hidden_states, llama_4_scaling)
         return self.mla_attn(positions, hidden_states, llama_4_scaling)
 """),
-    # B3. Indexer.forward：B 已经在本卡行上算好 wk_weights_proj 并 AG 回来
     ("""    def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
@@ -146,7 +135,6 @@ EDITS = [
     ("""            kw, _ = self.wk_weights_proj(hidden_states)
 """, """            kw = self.wk_weights_proj(hidden_states)[0] if kw is None else kw
 """, 2),
-    # 6. DeepseekV2Model.__init__：在 vLLM 估算显存之前建 RingComm
     ("""            prefix=f"{prefix}.layers",
         )
 
@@ -160,7 +148,6 @@ EDITS = [
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 """),
-    # 7. DeepseekV2Model.forward：最后一层 MoE 的 AR + final norm 换成 RS + add + RMSNorm + AG
     ("""        hidden_states, _ = self.norm(hidden_states, residual)
 """, """        if self.fuse_final:
             hidden_states = torch.ops.vllm.hcu_fuse_a_rs_norm_ag(

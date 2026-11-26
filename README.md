@@ -1,20 +1,18 @@
 # vllm-fuse-ab
 
-厂商 vLLM 0.21 + vllm_hcu 的 general plugin：把 GLM-5.2 每层两次 TP AllReduce（位置 A：o_proj 之后；位置 B：MoE 之后到下一层 q_b 之前）换成 FlagTree 的 rs+norm+ag ring kernel。不改镜像里的文件，运行时按 `vllm_fuse_ab/edits.py` 改 `vllm_hcu.models.deepseek_v2` 的源码再加载。
+A vLLM general plugin for vendor vLLM 0.21 + vllm_hcu. It replaces the two TP all-reduces of every GLM-5.2 MoE layer (A: after o_proj; B: after the MoE, up to the next layer's q_b) with FlagTree rs+norm+ag ring kernels. No file in the image is modified: at load time the plugin applies `vllm_fuse_ab/edits.py` to `vllm_hcu.models.deepseek_v2` and imports the result.
 
-安装：
+Install:
 
 ```bash
-pip install --no-deps --no-build-isolation /path/to/vllm-fuse-plugin
+pip install --no-deps --no-build-isolation /path/to/vllm-fuse-ab
 ```
 
-开关（不设时插件什么都不做）：
+Switches (the plugin does nothing when unset):
 
-| 环境变量 | 含义 |
+| Variable | Meaning |
 |---|---|
-| `VLLM_HCU_FUSE_A=1` | 打开位置 A（也是插件的总开关） |
-| `VLLM_HCU_FUSE_A_QUANT=2` | A 的 AG 传 fp8，router 在本卡 1/8 行上算（0 = AG bf16） |
-| `VLLM_HCU_FUSE_B=1` | 打开位置 B |
-| `VLLM_HCU_FUSE_A_KERNEL` | FlagTree `10-intra-node-rs-norm-ag.py` 的路径 |
-
-其余开关见 `vllm_fuse_ab/fuse_a.py`、`fuse_b.py` 开头的注释。
+| `VLLM_HCU_FUSE_A=1` | enable A (also the plugin's master switch) |
+| `VLLM_HCU_FUSE_A_QUANT=2` | A all-gathers fp8 + scale, router on this rank's rows (0 = bf16 all-gather) |
+| `VLLM_HCU_FUSE_B=1` | enable B |
+| `VLLM_HCU_FUSE_A_KERNEL` | path of FlagTree `10-intra-node-rs-norm-ag.py` |

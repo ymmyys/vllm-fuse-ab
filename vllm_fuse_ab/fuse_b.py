@@ -1,17 +1,3 @@
-# 位置 B：MoE 输出的 AR + 下一层 input_layernorm 换成 FlagTree 的 RS + add + RMSNorm（每卡只留自己的行），
-# qkv_a GEMM（和 full indexer 层的 wk_weights_proj）只算本卡行，再用 q / kv norm + AG 汇齐 [T, D] 给 attention。
-#
-#   原生：AR(MoE 部分和) → add + RMSNorm（T 行）→ fused_qkv_a_proj（T 行）→ q_a_layernorm / kv_a_layernorm
-#         full indexer 层另有 indexer.wk_weights_proj(hidden_states)（T 行）
-#   融合：rs+norm（本卡行）→ fused_qkv_a_proj（本卡行）[→ wk_weights_proj（本卡行），拼在行尾]
-#         → q / kv norm + AG（行尾原样传）→ [T, q_lora | kv_lora | rope (| head_dim + n_head)]
-#
-# 数学和原生逐 token 相同，只是每卡少算 7/8 的行、不再 AG 完整 hidden。residual 只更新本卡 row_range 的行，
-# 和位置 A 的约定一致，所以打开 B 时 A 之后不再 AG residual（fuse_a.GATHER_RESIDUAL 默认随之为 0）。
-# 用 fuse_a 的 RingComm 和同一套原生判断（T <= NATIVE_MAX_TOKENS 或录 CUDA graph 时走原生）：
-# 同一次 fwd 里 A 和 B 的路径一致。
-#
-# 环境变量：VLLM_HCU_FUSE_B=1 打开（需要 VLLM_HCU_FUSE_A=1）。只作用于前一层是融合 MoE 层的那些层的输入。
 import os
 
 import torch
@@ -27,17 +13,15 @@ logger = init_logger(__name__)
 ENABLED = fuse_a.ENABLED and fuse_a.FUSE_B
 
 _attn = {}  # layer_idx -> MultiHeadLatentAttentionWrapper
-_qkv_ops = {}  # 行宽 D -> fused_qkv_norm_ag
+_qkv_ops = {}
 
 
 def use_for_layer(vllm_config, config, layer_idx: int) -> bool:
-    """第 layer_idx 层的 input_layernorm（及其前面上一层 MoE 输出的 AR）是否走位置 B。"""
     return (ENABLED and 0 < layer_idx < config.num_hidden_layers
             and fuse_a.use_for_layer(vllm_config, config, layer_idx - 1))
 
 
 def moe_reduce_results(vllm_config, config, layer_idx: int) -> bool:
-    """第 layer_idx 层 MoE 的 FusedMoE 要不要自己做 AR：最后一层交给 final norm，下一层走 B 时交给 B。"""
     return not (fuse_a.use_for_final(vllm_config, config, layer_idx)
                 or use_for_layer(vllm_config, config, layer_idx + 1))
 
@@ -70,8 +54,6 @@ def _qkv_op(D):
 
 def _rs_norm_qkv(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float,
                  layer_idx: int) -> torch.Tensor:
-    """x：上一层 MoE 的部分和 [T, H]；residual：[T, H]，原地更新（融合时只更新本卡行）。
-    返回 [T, D] = q_c（已 q_a_layernorm）| kv_c（已 kv_a_layernorm）| k_pe | [indexer wk_weights_proj 输出]。"""
     w = _attn[layer_idx]
     Q, KV, R, KW = _widths(w)
     T = x.shape[0]
@@ -110,15 +92,12 @@ direct_register_custom_op(
 
 
 def input_layernorm(layer, hidden_states, residual):
-    """DecoderLayer 里走 B 的层：替换 input_layernorm(hidden_states, residual)，返回给 mla_forward 的 [T, D]。"""
     norm = layer.input_layernorm
     return torch.ops.vllm.hcu_fuse_b_rs_norm_qkv(hidden_states, residual, norm.weight, norm.variance_epsilon,
                                                   layer.layer_idx)
 
 
 def mla_forward(w, positions, qkv, llama_4_scaling=None):
-    """MultiHeadLatentAttentionWrapper.forward（厂商打过补丁的版本）在 q_lora 分支下的同一流程，
-    只是 fused_qkv_a_proj、q_a_layernorm、kv_a_layernorm、indexer 的 wk_weights_proj 已经在 B 里做完。"""
     Q, KV, R, KW = _widths(w)
     T = qkv.shape[0]
     q_c = qkv[:, :Q].contiguous()
@@ -130,7 +109,6 @@ def mla_forward(w, positions, qkv, llama_4_scaling=None):
     if w.rotary_emb is not None:
         q[..., w.qk_nope_head_dim:], k_pe = w.rotary_emb(positions, q[..., w.qk_nope_head_dim:], k_pe)
     if KW:
-        # indexer_op 只用 hidden_states 的行数和 device
         w.indexer(qkv, q_c, positions, w.indexer_rope_emb, kw=qkv[:, Q + KV + R:].contiguous())
     if llama_4_scaling is not None:
         q *= llama_4_scaling
