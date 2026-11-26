@@ -6,7 +6,7 @@ from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm_fuse_ab import fuse_a
+from vllm_hcu import fuse_a
 
 logger = init_logger(__name__)
 
